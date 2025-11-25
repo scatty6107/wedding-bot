@@ -3,139 +3,107 @@ const { Client, middleware } = require('@line/bot-sdk');
 const cors = require('cors');
 const app = express();
 
-// 1. 設定 LINE Channel 資訊
+// LINE 設定
 const config = {
   channelAccessToken: process.env.CHANNEL_ACCESS_TOKEN,
   channelSecret: process.env.CHANNEL_SECRET,
 };
-
-// 取得原本 Excel/GAS 的網址 (從環境變數)
-const GAS_URL = process.env.GAS_URL; 
-
 const client = new Client(config);
 
-// 記憶體暫存資料庫
+// 記憶體資料庫
 let submissions = new Map();
-
-// 簡易狀態追蹤
-const userState = {};
+// 用戶狀態暫存 { userId: { step: 'WAITING_PHOTO'|'WAITING_NAME', cat: 'groom', tempUrl: '...' } }
+let userState = {};
 
 app.use(cors());
 
-// 2. LINE Webhook 入口
 app.post('/webhook', middleware(config), (req, res) => {
-  // Promise.all 會等待所有事件處理完畢
   Promise.all(req.body.events.map(handleEvent))
     .then((result) => res.json(result))
-    .catch((err) => {
-      console.error(err);
-      res.status(500).end();
-    });
+    .catch((err) => { console.error(err); res.status(500).end(); });
 });
 
-// 3. 處理事件 (核心邏輯修改版)
 async function handleEvent(event) {
   const userId = event.source.userId;
-  let isHandledByPhotoBot = false; // 標記：照片機器人是否有處理這則訊息？
 
-  // --- A. 照片機器人邏輯開始 ---
-  
-  // A-1. 處理文字訊息 (報名意圖)
+  // 1. 文字訊息處理
   if (event.type === 'message' && event.message.type === 'text') {
     const text = event.message.text.trim();
-    let reply = '';
-    
-    if (text.includes('新郎')) {
-      userState[userId] = 'groom';
-      reply = '收到！請傳送「最帥新郎」的參賽照片📸';
-      isHandledByPhotoBot = true;
-    } else if (text.includes('新娘')) {
-      userState[userId] = 'bride';
-      reply = '收到！請傳送「最美新娘」的參賽照片📸';
-      isHandledByPhotoBot = true;
-    } else if (text.includes('創意')) {
-      userState[userId] = 'creative';
-      reply = '收到！請傳送「最佳創意」的參賽照片📸';
-      isHandledByPhotoBot = true;
-    } 
-    // 注意：如果是查桌次的名字，這裡 isHandledByPhotoBot 會是 false
-    
-    if (isHandledByPhotoBot) {
-      return client.replyMessage(event.replyToken, { type: 'text', text: reply });
+
+    // [階段3] 檢查是否在等待暱稱 (流程最後一步)
+    if (userState[userId] && userState[userId].step === 'WAITING_NAME') {
+        const name = text; // 用戶輸入的文字即為暱稱
+        const data = userState[userId];
+        
+        // 判斷是否為覆蓋 (Overwrite Check)
+        const isOverwrite = submissions.has(userId);
+        const replyText = isOverwrite ? '收到！已更新您的參賽作品 (舊照片已覆蓋) ✨' : '報名成功！祝您中大獎 🏆';
+
+        // 寫入正式名單
+        submissions.set(userId, {
+            id: Date.now(),
+            userId: userId,
+            url: data.tempUrl,
+            cat: data.cat,
+            uploader: name, // 使用輸入的暱稱
+            avatar: '', // LINE API 需額外權限抓頭像，此處留空或用預設
+            status: 'pending',
+            isWinner: false,
+            timestamp: Date.now()
+        });
+
+        // 清除狀態
+        delete userState[userId];
+
+        // 回覆成功
+        return client.replyMessage(event.replyToken, { type: 'text', text: replyText });
+    }
+
+    // [階段1] 檢查是否為報名指令 (靜默模式：不回覆，只記狀態)
+    if (text.includes('#我要報名')) {
+       let cat = '';
+       if (text.includes('新郎')) cat = 'groom';
+       else if (text.includes('新娘')) cat = 'bride';
+       else if (text.includes('創意')) cat = 'creative';
+       
+       if(cat) {
+           // 設定狀態：等待照片
+           userState[userId] = { step: 'WAITING_PHOTO', cat: cat };
+           // 這裡【不回覆】任何訊息，依照您的需求
+           return Promise.resolve(null); 
+       }
     }
   }
 
-  // A-2. 處理圖片訊息 (參賽作品)
+  // 2. 圖片訊息處理 (階段2)
   if (event.type === 'message' && event.message.type === 'image') {
-    // 只有當使用者已經選過分類，我們才攔截圖片
-    if (userState[userId]) {
-      isHandledByPhotoBot = true;
-      const category = userState[userId];
+      // 檢查是否有先選分類
+      if (!userState[userId] || userState[userId].step !== 'WAITING_PHOTO') {
+          return client.replyMessage(event.replyToken, { type: 'text', text: '請先點選選單選擇報名項目喔！' });
+      }
 
-      // 取得照片內容
+      // 取得照片二進制流
       const stream = await client.getMessageContent(event.message.id);
       const chunks = [];
       for await (const chunk of stream) { chunks.push(chunk); }
       const buffer = Buffer.concat(chunks);
-      
       const base64Img = `data:image/jpeg;base64,${buffer.toString('base64')}`;
-      const isOverwrite = submissions.has(userId);
-      
-      submissions.set(userId, {
-          id: Date.now(),
-          userId: userId,
-          url: base64Img, 
-          cat: category,
-          uploader: 'Guest', 
-          status: 'pending',
-          timestamp: Date.now()
-      });
 
-      const replyText = isOverwrite ? '收到您上傳的新作品 (舊照片已覆蓋) ✨' : '報名成功！祝您中大獎 🏆';
-      return client.replyMessage(event.replyToken, { type: 'text', text: replyText });
-    }
+      // 更新狀態：暫存照片，改為等待暱稱
+      userState[userId].step = 'WAITING_NAME';
+      userState[userId].tempUrl = base64Img;
+
+      // 回覆引導輸入暱稱
+      return client.replyMessage(event.replyToken, { type: 'text', text: '收到照片了！請輸入您的「暱稱」來完成報名。' });
   }
-  // --- A. 照片機器人邏輯結束 ---
-
-
-  // --- B. 轉接給 Excel 機器人 (如果上面沒處理，就轉傳) ---
-  if (!isHandledByPhotoBot && GAS_URL) {
-    try {
-      // 我們要把這個 event 包裝成 LINE 原始的格式傳給 Excel 腳本
-      // Google Apps Script 通常預期收到 { events: [...] }
-      const forwardBody = {
-        destination: event.destination, // 雖然 GAS 可能不用，但補上比較完整
-        events: [event]
-      };
-
-      // 使用 fetch 轉傳 (不等待回應，避免拖慢速度)
-      await fetch(GAS_URL, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          // 模擬 LINE 的簽章，雖然 GAS 通常不驗證這個，但以防萬一
-          'x-line-signature': 'forwarded-by-render' 
-        },
-        body: JSON.stringify(forwardBody)
-      });
-      
-      console.log('已轉發訊息給 Excel 機器人');
-      return Promise.resolve(null); // 我們這邊不回話，讓 Excel 機器人回
-    } catch (error) {
-      console.error('轉發失敗:', error);
-    }
-  }
-
-  return Promise.resolve(null);
 }
 
-// 4. 前端 API
+// API: 供前端戰情室抓取資料
 app.get('/api/photos', (req, res) => {
+  // 只回傳已完成 (有暱稱) 的資料
   const list = Array.from(submissions.values());
   res.json(list);
 });
 
 const port = process.env.PORT || 3000;
-app.listen(port, () => {
-  console.log(`listening on ${port}`);
-});
+app.listen(port, () => console.log(`Listening on ${port}`));
