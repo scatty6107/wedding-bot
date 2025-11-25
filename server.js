@@ -23,6 +23,11 @@ let userState = {};           // 暫存狀態
 let lastImageUpload = {};     // 記錄用戶最後上傳圖片的時間 (防批次上傳)
 
 // ====================================
+// 🆕 測試模式開關
+// ====================================
+let testMode = process.env.TEST_MODE === 'true' || false;
+
+// ====================================
 // 3. 安全機制設定
 // ====================================
 const MAX_MEMORY_PHOTOS = 60;           // 最多存 60 張壓縮後照片
@@ -133,6 +138,19 @@ async function compressImage(buffer) {
 }
 
 // ====================================
+// 🆕 生成提交 Key (測試模式 vs 正式模式)
+// ====================================
+function generateSubmissionKey(userId) {
+  if (testMode) {
+    // 測試模式：userId + 時間戳，允許同一用戶多張照片
+    return `${userId}_${Date.now()}`;
+  } else {
+    // 正式模式：只用 userId，同一用戶只能有一張
+    return userId;
+  }
+}
+
+// ====================================
 // 7. 記憶體狀態 API (除錯用)
 // ====================================
 app.use(cors());
@@ -142,6 +160,7 @@ app.get('/api/status', (req, res) => {
   res.json({
     photos: submissions.size,
     pendingUploads: Object.keys(userState).length,
+    testMode: testMode,  // 🆕 回傳測試模式狀態
     lastActivity: new Date(lastActivityTime).toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' }),
     nextAutoClear: new Date(lastActivityTime + INACTIVITY_CLEAR_TIME).toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' }),
     memory: {
@@ -149,6 +168,28 @@ app.get('/api/status', (req, res) => {
       heapTotal: `${(memUsage.heapTotal / 1024 / 1024).toFixed(1)} MB`,
       rss: `${(memUsage.rss / 1024 / 1024).toFixed(1)} MB`
     }
+  });
+});
+
+// ====================================
+// 🆕 測試模式切換 API
+// ====================================
+app.post('/api/test-mode', (req, res) => {
+  testMode = !testMode;
+  console.log(`🧪 [測試模式] ${testMode ? '已開啟' : '已關閉'}`);
+  res.json({ 
+    success: true,
+    testMode: testMode, 
+    message: testMode ? '🧪 測試模式已開啟 - 同一帳號可上傳多張照片' : '✅ 測試模式已關閉 - 恢復正常模式',
+    timestamp: new Date().toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' })
+  });
+});
+
+// 🆕 取得測試模式狀態
+app.get('/api/test-mode', (req, res) => {
+  res.json({ 
+    testMode: testMode,
+    description: testMode ? '同一帳號可上傳多張照片' : '同一帳號僅保留最新一張'
   });
 });
 
@@ -185,22 +226,33 @@ async function handleEvent(event) {
       // 更新活動時間
       updateActivity();
 
+      // 🆕 使用新的 key 生成邏輯
+      const submissionKey = generateSubmissionKey(userId);
+      
       // --- 記憶體防爆檢查 ---
-      const isOverwrite = submissions.has(userId);
-      if (!isOverwrite && submissions.size >= MAX_MEMORY_PHOTOS) {
+      const isOverwrite = !testMode && submissions.has(userId);
+      if (submissions.size >= MAX_MEMORY_PHOTOS) {
         const oldestKey = submissions.keys().next().value;
         submissions.delete(oldestKey);
         console.log(`⚠️ [記憶體保護] 已自動移除最舊資料 (${oldestKey.substring(0, 10)}...)`);
       }
 
-      const replyText = isOverwrite 
-        ? `收到！${name}，您的作品已更新 (舊照片已覆蓋) ✨` 
-        : `報名成功！感謝 ${name} 的參與 🏆`;
+      // 🆕 根據測試模式調整回覆訊息
+      let replyText;
+      if (testMode) {
+        const userPhotoCount = Array.from(submissions.keys()).filter(k => k.startsWith(userId)).length + 1;
+        replyText = `🧪 [測試模式] 收到！${name}，這是您的第 ${userPhotoCount} 張照片 ✨`;
+      } else {
+        replyText = isOverwrite 
+          ? `收到！${name}，您的作品已更新 (舊照片已覆蓋) ✨` 
+          : `報名成功！感謝 ${name} 的參與 🏆`;
+      }
 
       // 寫入正式名單
-      submissions.set(userId, {
+      submissions.set(submissionKey, {
         id: Date.now(),
-        userId: userId,
+        odialog: submissionKey,  // 🆕 儲存實際的 key (用於前端識別)
+        userId: userId,           // 🆕 保留原始 userId
         url: data.tempUrl,
         cat: data.cat,
         uploader: name,
@@ -214,7 +266,7 @@ async function handleEvent(event) {
       delete userState[userId];
       isHandledByPhotoBot = true;
 
-      console.log(`✅ [報名成功] ${name} (${data.cat}) - 目前共 ${submissions.size} 張照片`);
+      console.log(`✅ [報名成功] ${name} (${data.cat}) - Key: ${submissionKey.substring(0, 20)}... - 目前共 ${submissions.size} 張照片 ${testMode ? '[測試模式]' : ''}`);
 
       return client.replyMessage(event.replyToken, { type: 'text', text: replyText });
     }
@@ -236,7 +288,7 @@ async function handleEvent(event) {
           timestamp: Date.now()  // 加入時間戳記供逾時清理
         };
         isHandledByPhotoBot = true;
-        console.log(`📝 [開始報名] 用戶選擇: ${cat}`);
+        console.log(`📝 [開始報名] 用戶選擇: ${cat} ${testMode ? '[測試模式]' : ''}`);
         return Promise.resolve(null);
       }
     }
@@ -248,8 +300,8 @@ async function handleEvent(event) {
   if (event.type === 'message' && event.message.type === 'image') {
     const now = Date.now();
 
-    // [檢查 1] 批次上傳檢測 - 3 秒內多張圖片
-    if (lastImageUpload[userId] && (now - lastImageUpload[userId]) < BATCH_UPLOAD_THRESHOLD) {
+    // 🆕 [檢查 1] 批次上傳檢測 - 測試模式下跳過此檢查
+    if (!testMode && lastImageUpload[userId] && (now - lastImageUpload[userId]) < BATCH_UPLOAD_THRESHOLD) {
       console.log(`⚠️ [批次上傳] 用戶 ${userId.substring(0, 10)}... 短時間內上傳多張`);
       isHandledByPhotoBot = true;
       // 不存入記憶體，直接回覆警告
@@ -297,9 +349,12 @@ async function handleEvent(event) {
       userState[userId].tempUrl = base64Img;
       userState[userId].timestamp = Date.now(); // 更新時間戳記
 
+      // 🆕 測試模式下的提示訊息
+      const modeHint = testMode ? '\n\n🧪 測試模式：此照片不會覆蓋之前的上傳' : '';
+
       return client.replyMessage(event.replyToken, { 
         type: 'text', 
-        text: '📸 收到照片了！\n\n請輸入您的「暱稱」或「名字」來完成報名 (例如：表弟阿豪) 👇' 
+        text: `📸 收到照片了！\n\n請輸入您的「暱稱」或「名字」來完成報名 (例如：表弟阿豪) 👇${modeHint}` 
       });
 
     } catch (error) {
@@ -386,5 +441,6 @@ app.listen(port, () => {
   console.log(`🖼️ 圖片壓縮: ${IMAGE_CONFIG.maxSize}px (最長邊) / ${IMAGE_CONFIG.quality}%`);
   console.log(`⏰ 自動清空: ${INACTIVITY_CLEAR_TIME / 1000 / 60} 分鐘無活動`);
   console.log(`🗑️ userState 逾時: ${USER_STATE_TIMEOUT / 1000 / 60} 分鐘`);
+  console.log(`🧪 測試模式: ${testMode ? '開啟' : '關閉'}`);
   console.log('========================================');
 });
