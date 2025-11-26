@@ -22,26 +22,30 @@ let submissions = new Map();
 let userState = {};
 let lastImageUpload = {};
 
-// ====================================
-// 🆕 V24: 測試模式計數器
-// ====================================
+// 🆕 V25: 測試模式持續類別記憶
+let userLastCategory = {};
+
 let testMode = process.env.TEST_MODE === 'true' || false;
 let submissionsOpen = true;
 let guestCounter = 0;
 
 // ====================================
-// 3. 安全機制設定
+// 3. 安全機制設定 - 🆕 V25: 放寬限制
 // ====================================
-const MAX_MEMORY_PHOTOS = 60;
+const MAX_MEMORY_PHOTOS = 150;  // 🆕 V25: 60 → 150 張
 const USER_STATE_TIMEOUT = 5 * 60 * 1000;
-const INACTIVITY_CLEAR_TIME = 6 * 60 * 60 * 1000; // 🆕 V24: 6 小時
+const INACTIVITY_CLEAR_TIME = 6 * 60 * 60 * 1000;
 
 const IMAGE_CONFIG = {
   maxSize: 1920,
-  quality: 70,
+  quality: 65,  // 🆕 V25: 70 → 65 稍微降低以容納更多照片
 };
 
 const MAX_NICKNAME_LENGTH = 9;
+
+// 🆕 V25: 重試設定
+const MAX_RETRIES = 3;
+const RETRY_DELAY = 1000;
 
 // ====================================
 // 4. 活動追蹤 & 自動清空機制
@@ -64,6 +68,7 @@ function clearAllData() {
   submissions.clear();
   userState = {};
   lastImageUpload = {};
+  userLastCategory = {};
   guestCounter = 0;
   console.log(`🧹 [自動清空] 6小時無活動，已清除 ${photoCount} 張照片`);
 }
@@ -88,8 +93,28 @@ setInterval(() => {
 }, 60 * 1000);
 
 // ====================================
-// 6. 圖片壓縮函式
+// 6. 圖片處理函式 - 🆕 V25: 加入重試機制
 // ====================================
+async function getImageWithRetry(messageId, retries = MAX_RETRIES) {
+  for (let i = 0; i < retries; i++) {
+    try {
+      const stream = await client.getMessageContent(messageId);
+      const chunks = [];
+      for await (const chunk of stream) {
+        chunks.push(chunk);
+      }
+      return Buffer.concat(chunks);
+    } catch (error) {
+      console.log(`⚠️ [重試 ${i + 1}/${retries}] 取得圖片失敗: ${error.code || error.message}`);
+      if (i < retries - 1) {
+        await new Promise(resolve => setTimeout(resolve, RETRY_DELAY * (i + 1)));
+      } else {
+        throw error;
+      }
+    }
+  }
+}
+
 async function compressImage(buffer) {
   try {
     const compressed = await sharp(buffer)
@@ -99,6 +124,10 @@ async function compressImage(buffer) {
       })
       .jpeg({ quality: IMAGE_CONFIG.quality, mozjpeg: true })
       .toBuffer();
+    
+    const originalKB = (buffer.length / 1024).toFixed(1);
+    const compressedKB = (compressed.length / 1024).toFixed(1);
+    console.log(`📸 [壓縮] ${originalKB}KB → ${compressedKB}KB`);
     return compressed;
   } catch (error) {
     console.error('⚠️ [壓縮失敗]', error.message);
@@ -121,11 +150,13 @@ function truncateNickname(name) {
 // 7. API 端點
 // ====================================
 app.use(cors());
+app.use(express.json());
 
 app.get('/api/status', (req, res) => {
   const memUsage = process.memoryUsage();
   res.json({
     photos: submissions.size,
+    maxPhotos: MAX_MEMORY_PHOTOS,
     pendingUploads: Object.keys(userState).length,
     testMode, submissionsOpen, guestCounter,
     lastActivity: new Date(lastActivityTime).toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' }),
@@ -140,12 +171,12 @@ app.get('/api/status', (req, res) => {
 
 app.post('/api/test-mode', (req, res) => {
   testMode = !testMode;
-  if (testMode) guestCounter = 0;
+  if (testMode) {
+    guestCounter = 0;
+    userLastCategory = {};
+  }
   console.log(`🧪 [測試模式] ${testMode ? '已開啟' : '已關閉'}`);
-  res.json({ 
-    success: true, testMode, 
-    message: testMode ? '🧪 測試模式已開啟 - 可批量上傳，自動編號暱稱' : '✅ 測試模式已關閉 - 恢復正常模式'
-  });
+  res.json({ success: true, testMode, message: testMode ? '🧪 測試模式已開啟' : '✅ 測試模式已關閉' });
 });
 
 app.get('/api/test-mode', (req, res) => {
@@ -160,6 +191,69 @@ app.post('/api/submission-status', (req, res) => {
   submissionsOpen = !submissionsOpen;
   console.log(`📝 [報名狀態] ${submissionsOpen ? '已開放' : '已暫停'}`);
   res.json({ success: true, submissionsOpen, message: submissionsOpen ? '✅ 報名已開放' : '⏸️ 報名已暫停' });
+});
+
+// ====================================
+// 🆕 V25: 照片狀態同步 API
+// ====================================
+app.get('/api/photos', (req, res) => {
+  const list = Array.from(submissions.values());
+  res.json(list);
+});
+
+// 🆕 V25: 更新單張照片狀態
+app.post('/api/photos/:id/status', (req, res) => {
+  const { id } = req.params;
+  const { status, isWinner } = req.body;
+  
+  const photo = submissions.get(id);
+  if (!photo) {
+    return res.status(404).json({ success: false, message: '照片不存在' });
+  }
+  
+  if (status !== undefined) {
+    photo.status = status;
+  }
+  if (isWinner !== undefined) {
+    // 如果設為冠軍，先取消同類別其他冠軍
+    if (isWinner) {
+      for (const [key, p] of submissions) {
+        if (p.cat === photo.cat && p.isWinner) {
+          p.isWinner = false;
+          submissions.set(key, p);
+        }
+      }
+    }
+    photo.isWinner = isWinner;
+  }
+  
+  submissions.set(id, photo);
+  console.log(`📝 [狀態更新] ${id.substring(0, 10)}... → ${status || ''} ${isWinner ? '👑' : ''}`);
+  
+  res.json({ success: true, photo });
+});
+
+// 🆕 V25: 批次更新狀態
+app.post('/api/photos/batch-update', (req, res) => {
+  const { updates } = req.body;
+  
+  if (!Array.isArray(updates)) {
+    return res.status(400).json({ success: false, message: '無效的更新格式' });
+  }
+  
+  let updated = 0;
+  for (const { id, status, isWinner } of updates) {
+    const photo = submissions.get(id);
+    if (photo) {
+      if (status !== undefined) photo.status = status;
+      if (isWinner !== undefined) photo.isWinner = isWinner;
+      submissions.set(id, photo);
+      updated++;
+    }
+  }
+  
+  console.log(`📝 [批次更新] ${updated} 張照片`);
+  res.json({ success: true, updated });
 });
 
 // ====================================
@@ -194,6 +288,7 @@ async function handleEvent(event) {
       if (submissions.size >= MAX_MEMORY_PHOTOS) {
         const oldestKey = submissions.keys().next().value;
         submissions.delete(oldestKey);
+        console.log(`⚠️ [記憶體保護] 已移除最舊資料`);
       }
 
       submissions.set(submissionKey, {
@@ -204,7 +299,7 @@ async function handleEvent(event) {
         cat: data.cat,
         uploader: name,
         avatar: '',
-        status: 'pending',
+        status: 'pending',  // 🆕 V25: 後端也存儲狀態
         isWinner: false,
         timestamp: Date.now()
       });
@@ -237,10 +332,23 @@ async function handleEvent(event) {
       if (cat) {
         updateActivity();
         userState[userId] = { step: 'WAITING_PHOTO', cat, timestamp: Date.now() };
+        // 🆕 V25: 記住用戶選擇的類別（測試模式用）
+        userLastCategory[userId] = cat;
         isHandledByPhotoBot = true;
+        console.log(`📝 [選擇類別] ${cat} ${testMode ? '[測試模式]' : ''}`);
         return Promise.resolve(null);
       }
     }
+  }
+
+  // 🆕 V25: 影片訊息處理 - 拒絕接收
+  if (event.type === 'message' && event.message.type === 'video') {
+    isHandledByPhotoBot = true;
+    console.log(`🎬 [影片拒絕] 用戶 ${userId.substring(0, 10)}... 上傳影片`);
+    return client.replyMessage(event.replyToken, { 
+      type: 'text', 
+      text: '📷 抱歉，目前只接受照片投稿喔！\n\n請上傳您的精彩照片 📸' 
+    });
   }
 
   // B. 圖片訊息處理
@@ -253,21 +361,26 @@ async function handleEvent(event) {
       });
     }
 
-    // 🆕 V24: 測試模式 - 完全跳過限制，自動編號
+    // 🆕 V25: 測試模式 - 使用記憶的類別
     if (testMode) {
       isHandledByPhotoBot = true;
-      let cat = 'creative';
+      
+      // 🆕 V25: 優先使用 userState，其次使用 userLastCategory
+      let cat = 'creative';  // 預設
       if (userState[userId] && userState[userId].step === 'WAITING_PHOTO') {
         cat = userState[userId].cat;
-        delete userState[userId];
+        // 不清除 userState，保留類別記憶
+      } else if (userLastCategory[userId]) {
+        // 使用上次選擇的類別
+        cat = userLastCategory[userId];
       }
 
       try {
         updateActivity();
-        const stream = await client.getMessageContent(event.message.id);
-        const chunks = [];
-        for await (const chunk of stream) chunks.push(chunk);
-        const compressedBuffer = await compressImage(Buffer.concat(chunks));
+        
+        // 🆕 V25: 使用重試機制
+        const originalBuffer = await getImageWithRetry(event.message.id);
+        const compressedBuffer = await compressImage(originalBuffer);
         const base64Img = `data:image/jpeg;base64,${compressedBuffer.toString('base64')}`;
 
         guestCounter++;
@@ -288,11 +401,14 @@ async function handleEvent(event) {
         const catName = cat === 'groom' ? '最帥新郎賞' : cat === 'bride' ? '最美新娘賞' : '最佳創意賞';
         return client.replyMessage(event.replyToken, { 
           type: 'text', 
-          text: `🧪 測試模式收到！\n\n自動編號：${autoName}\n類別：${catName}\n\n可繼續上傳 📸` 
+          text: `🧪 測試模式收到！\n\n自動編號：${autoName}\n類別：${catName}\n\n繼續上傳會投稿同一類別\n切換類別請點選上方選單 📸` 
         });
       } catch (error) {
-        console.error('❌ [圖片處理失敗]', error);
-        return client.replyMessage(event.replyToken, { type: 'text', text: '😅 處理失敗，請重試！' });
+        console.error('❌ [圖片處理失敗]', error.code || error.message);
+        return client.replyMessage(event.replyToken, { 
+          type: 'text', 
+          text: '😅 網路不穩定，請稍後再試一次！\n\n如持續失敗，請稍等幾秒後重新上傳 📶' 
+        });
       }
     }
 
@@ -308,10 +424,10 @@ async function handleEvent(event) {
     isHandledByPhotoBot = true;
     try {
       updateActivity();
-      const stream = await client.getMessageContent(event.message.id);
-      const chunks = [];
-      for await (const chunk of stream) chunks.push(chunk);
-      const compressedBuffer = await compressImage(Buffer.concat(chunks));
+      
+      // 🆕 V25: 使用重試機制
+      const originalBuffer = await getImageWithRetry(event.message.id);
+      const compressedBuffer = await compressImage(originalBuffer);
       const base64Img = `data:image/jpeg;base64,${compressedBuffer.toString('base64')}`;
 
       userState[userId].step = 'WAITING_NAME';
@@ -323,9 +439,12 @@ async function handleEvent(event) {
         text: `📸 收到照片了！\n\n請輸入您的「暱稱」(最多${MAX_NICKNAME_LENGTH}個字) 來完成報名\n例如：表弟阿豪 👇` 
       });
     } catch (error) {
-      console.error('❌ [圖片處理失敗]', error);
+      console.error('❌ [圖片處理失敗]', error.code || error.message);
       delete userState[userId];
-      return client.replyMessage(event.replyToken, { type: 'text', text: '😅 處理失敗，請重試！' });
+      return client.replyMessage(event.replyToken, { 
+        type: 'text', 
+        text: '😅 網路不穩定，請稍後再試一次！\n\n如持續失敗，請稍等幾秒後重新上傳 📶' 
+      });
     }
   }
 
@@ -349,13 +468,12 @@ async function handleEvent(event) {
 // ====================================
 // 10. 其他 API
 // ====================================
-app.get('/api/photos', (req, res) => res.json(Array.from(submissions.values())));
-
 app.post('/api/clear', (req, res) => {
   const count = submissions.size;
   submissions.clear();
   userState = {};
   lastImageUpload = {};
+  userLastCategory = {};
   guestCounter = 0;
   res.json({ success: true, message: `已清空 ${count} 張照片` });
 });
@@ -371,8 +489,10 @@ app.post('/api/extend', (req, res) => {
 const port = process.env.PORT || 3000;
 app.listen(port, () => {
   console.log('========================================');
-  console.log(`🚀 婚禮神攝手後端 V24 - Port ${port}`);
+  console.log(`🚀 婚禮神攝手後端 V25 - Port ${port}`);
+  console.log(`📦 最大照片數: ${MAX_MEMORY_PHOTOS} 張`);
+  console.log(`🖼️ 圖片品質: ${IMAGE_CONFIG.quality}%`);
   console.log(`⏰ 自動清空: 6 小時無活動`);
-  console.log(`📝 暱稱上限: ${MAX_NICKNAME_LENGTH} 字`);
+  console.log(`🔄 重試次數: ${MAX_RETRIES}`);
   console.log('========================================');
 });
