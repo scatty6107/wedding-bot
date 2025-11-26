@@ -150,7 +150,8 @@ function truncateNickname(name) {
 // 7. API 端點
 // ====================================
 app.use(cors());
-app.use(express.json());
+// ⚠️ 注意：不要在這裡全局使用 express.json()
+// LINE SDK middleware 需要原始的 request body 來驗證簽名
 
 app.get('/api/status', (req, res) => {
   const memUsage = process.memoryUsage();
@@ -202,7 +203,7 @@ app.get('/api/photos', (req, res) => {
 });
 
 // 🆕 V25: 更新單張照片狀態
-app.post('/api/photos/:id/status', (req, res) => {
+app.post('/api/photos/:id/status', express.json(), (req, res) => {
   const { id } = req.params;
   const { status, isWinner } = req.body;
   
@@ -234,7 +235,7 @@ app.post('/api/photos/:id/status', (req, res) => {
 });
 
 // 🆕 V25: 批次更新狀態
-app.post('/api/photos/batch-update', (req, res) => {
+app.post('/api/photos/batch-update', express.json(), (req, res) => {
   const { updates } = req.body;
   
   if (!Array.isArray(updates)) {
