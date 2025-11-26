@@ -1,8 +1,8 @@
 const express = require('express');
 const { Client, middleware } = require('@line/bot-sdk');
 const cors = require('cors');
-const cloudinary = require('cloudinary').v2; // 新增：Cloudinary
-const streamifier = require('streamifier');    // 新增：Stream 轉換工具
+const cloudinary = require('cloudinary').v2; // 引入 Cloudinary
+const streamifier = require('streamifier');    // 引入 Stream 轉換工具
 const app = express();
 
 // ====================================
@@ -17,7 +17,7 @@ const GAS_URL = process.env.GAS_URL;
 const client = new Client(config);
 
 // ====================================
-// Cloudinary 設定 (新增)
+// Cloudinary 設定
 // ====================================
 cloudinary.config({
     cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
@@ -40,7 +40,6 @@ let guestCounter = 0;
 // ====================================
 // 3. 安全機制設定
 // ====================================
-// 雖然圖片上雲端了，但為了避免變數(Map)佔用過多記憶體，還是保留上限
 const MAX_MEMORY_PHOTOS = 150; 
 const USER_STATE_TIMEOUT = 5 * 60 * 1000;
 const INACTIVITY_CLEAR_TIME = 6 * 60 * 60 * 1000;
@@ -87,9 +86,8 @@ setInterval(() => {
 }, 60 * 1000);
 
 // ====================================
-// 6. 圖片處理函式 (改為上傳至 Cloudinary)
+// 6. 圖片處理函式 (Cloudinary 原圖上傳)
 // ====================================
-// 這個函式直接回傳 Cloudinary 的 Secure URL
 async function uploadToCloudinary(messageId, userId) {
     return new Promise(async (resolve, reject) => {
         try {
@@ -102,7 +100,7 @@ async function uploadToCloudinary(messageId, userId) {
                     folder: "wedding_2025", // 雲端資料夾名稱
                     public_id: `${userId}_${Date.now()}`, // 檔名
                     resource_type: "image",
-                    transformation: [{ width: 1024, crop: "limit" }] // 選用：限制最大寬度節省流量
+                    // 👇 已移除 transformation 壓縮設定，保留原圖畫質
                 },
                 (error, result) => {
                     if (error) return reject(error);
@@ -110,10 +108,6 @@ async function uploadToCloudinary(messageId, userId) {
                 }
             );
 
-            // 將 LINE 的資料灌入 Cloudinary
-            // 注意：client.getMessageContent 回傳的是 ReadableStream
-            // 我們需要把它轉換或是直接 pipe。如果 LINE SDK 回傳的是 buffer，則用 streamifier
-            // 根據 @line/bot-sdk 文件，getMessageContent 回傳的是 ReadableStream
             stream.pipe(uploadStream);
         } catch (error) {
             reject(error);
@@ -449,9 +443,9 @@ async function handleEvent(event) {
 const port = process.env.PORT || 3000;
 app.listen(port, () => {
   console.log('========================================');
-  console.log(`🚀 婚禮神攝手後端 V25.1 (Cloudinary版) - Port ${port}`);
+  console.log(`🚀 婚禮神攝手後端 V25.1 (Cloudinary 無壓縮版) - Port ${port}`);
   console.log(`📦 最大照片數: ${MAX_MEMORY_PHOTOS} 張`);
-  console.log(`☁️ 圖片儲存: Cloudinary`);
+  console.log(`☁️ 圖片儲存: Cloudinary (原圖上傳)`);
   console.log(`⏰ 自動清空: 6 小時無活動`);
   console.log('========================================');
 });
