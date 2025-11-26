@@ -1,7 +1,7 @@
 const express = require('express');
 const { Client, middleware } = require('@line/bot-sdk');
 const cors = require('cors');
-const sharp = require('sharp'); // 圖片壓縮
+const sharp = require('sharp');
 const app = express();
 
 // ====================================
@@ -18,27 +18,27 @@ const client = new Client(config);
 // ====================================
 // 2. 資料庫與狀態
 // ====================================
-let submissions = new Map();  // 正式照片
-let userState = {};           // 暫存狀態
-let lastImageUpload = {};     // 記錄用戶最後上傳圖片的時間 (防批次上傳)
+let submissions = new Map();
+let userState = {};
+let lastImageUpload = {};
 
 // ====================================
-// 🆕 測試模式開關
+// 🆕 測試模式 & 報名狀態開關
 // ====================================
 let testMode = process.env.TEST_MODE === 'true' || false;
+let submissionsOpen = true;  // 🆕 V23: 報名開關
 
 // ====================================
 // 3. 安全機制設定
 // ====================================
-const MAX_MEMORY_PHOTOS = 60;           // 最多存 60 張壓縮後照片
-const USER_STATE_TIMEOUT = 5 * 60 * 1000;  // userState 5 分鐘逾時
-const INACTIVITY_CLEAR_TIME = 2 * 60 * 60 * 1000; // 2 小時無活動清空
-const BATCH_UPLOAD_THRESHOLD = 3 * 1000;  // 3 秒內視為批次上傳
+const MAX_MEMORY_PHOTOS = 60;
+const USER_STATE_TIMEOUT = 5 * 60 * 1000;
+const INACTIVITY_CLEAR_TIME = 2 * 60 * 60 * 1000;
+const BATCH_UPLOAD_THRESHOLD = 3 * 1000;
 
-// 圖片壓縮設定
 const IMAGE_CONFIG = {
-  maxSize: 1920,      // 最長邊 1920px (Full HD)
-  quality: 70,        // JPEG 品質 (1-100)
+  maxSize: 1920,
+  quality: 70,
 };
 
 // ====================================
@@ -47,23 +47,16 @@ const IMAGE_CONFIG = {
 let lastActivityTime = Date.now();
 let inactivityTimer = null;
 
-// 更新最後活動時間
 function updateActivity() {
   lastActivityTime = Date.now();
   resetInactivityTimer();
 }
 
-// 重設不活動計時器
 function resetInactivityTimer() {
-  if (inactivityTimer) {
-    clearTimeout(inactivityTimer);
-  }
-  inactivityTimer = setTimeout(() => {
-    clearAllData();
-  }, INACTIVITY_CLEAR_TIME);
+  if (inactivityTimer) clearTimeout(inactivityTimer);
+  inactivityTimer = setTimeout(() => clearAllData(), INACTIVITY_CLEAR_TIME);
 }
 
-// 清空所有資料
 function clearAllData() {
   const photoCount = submissions.size;
   const stateCount = Object.keys(userState).length;
@@ -77,7 +70,6 @@ function clearAllData() {
   console.log(`🧹 [自動清空] 時間: ${new Date().toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' })}`);
 }
 
-// 啟動時初始化計時器
 resetInactivityTimer();
 
 // ====================================
@@ -88,7 +80,6 @@ setInterval(() => {
   let cleanedStateCount = 0;
   let cleanedUploadCount = 0;
   
-  // 清理逾時的 userState
   for (const [uId, state] of Object.entries(userState)) {
     if (now - state.timestamp > USER_STATE_TIMEOUT) {
       delete userState[uId];
@@ -96,7 +87,6 @@ setInterval(() => {
     }
   }
   
-  // 清理過期的 lastImageUpload 記錄 (超過 1 分鐘的)
   for (const [uId, timestamp] of Object.entries(lastImageUpload)) {
     if (now - timestamp > 60 * 1000) {
       delete lastImageUpload[uId];
@@ -107,7 +97,7 @@ setInterval(() => {
   if (cleanedStateCount > 0 || cleanedUploadCount > 0) {
     console.log(`🗑️ [定時清理] userState: ${cleanedStateCount} 個, lastImageUpload: ${cleanedUploadCount} 個`);
   }
-}, 60 * 1000); // 每分鐘執行
+}, 60 * 1000);
 
 // ====================================
 // 6. 圖片壓縮函式
@@ -116,12 +106,12 @@ async function compressImage(buffer) {
   try {
     const compressed = await sharp(buffer)
       .resize(IMAGE_CONFIG.maxSize, IMAGE_CONFIG.maxSize, { 
-        withoutEnlargement: true,  // 小圖不放大
-        fit: 'inside'              // 等比例縮放，最長邊不超過 maxSize
+        withoutEnlargement: true,
+        fit: 'inside'
       })
       .jpeg({ 
         quality: IMAGE_CONFIG.quality,
-        mozjpeg: true  // 更好的壓縮
+        mozjpeg: true
       })
       .toBuffer();
     
@@ -132,35 +122,34 @@ async function compressImage(buffer) {
     return compressed;
   } catch (error) {
     console.error('⚠️ [壓縮失敗]', error.message);
-    // 壓縮失敗時回傳原圖（但這可能有風險）
     return buffer;
   }
 }
 
 // ====================================
-// 🆕 生成提交 Key (測試模式 vs 正式模式)
+// 生成提交 Key
 // ====================================
 function generateSubmissionKey(userId) {
   if (testMode) {
-    // 測試模式：userId + 時間戳，允許同一用戶多張照片
     return `${userId}_${Date.now()}`;
   } else {
-    // 正式模式：只用 userId，同一用戶只能有一張
     return userId;
   }
 }
 
 // ====================================
-// 7. 記憶體狀態 API (除錯用)
+// 7. API 端點
 // ====================================
 app.use(cors());
 
+// 狀態 API
 app.get('/api/status', (req, res) => {
   const memUsage = process.memoryUsage();
   res.json({
     photos: submissions.size,
     pendingUploads: Object.keys(userState).length,
-    testMode: testMode,  // 🆕 回傳測試模式狀態
+    testMode: testMode,
+    submissionsOpen: submissionsOpen,  // 🆕 V23
     lastActivity: new Date(lastActivityTime).toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' }),
     nextAutoClear: new Date(lastActivityTime + INACTIVITY_CLEAR_TIME).toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' }),
     memory: {
@@ -171,9 +160,7 @@ app.get('/api/status', (req, res) => {
   });
 });
 
-// ====================================
-// 🆕 測試模式切換 API
-// ====================================
+// 測試模式 API
 app.post('/api/test-mode', (req, res) => {
   testMode = !testMode;
   console.log(`🧪 [測試模式] ${testMode ? '已開啟' : '已關閉'}`);
@@ -185,11 +172,29 @@ app.post('/api/test-mode', (req, res) => {
   });
 });
 
-// 🆕 取得測試模式狀態
 app.get('/api/test-mode', (req, res) => {
   res.json({ 
     testMode: testMode,
     description: testMode ? '同一帳號可上傳多張照片' : '同一帳號僅保留最新一張'
+  });
+});
+
+// 🆕 V23: 報名狀態 API
+app.get('/api/submission-status', (req, res) => {
+  res.json({ 
+    submissionsOpen: submissionsOpen,
+    description: submissionsOpen ? '目前開放報名' : '報名已暫停'
+  });
+});
+
+app.post('/api/submission-status', (req, res) => {
+  submissionsOpen = !submissionsOpen;
+  console.log(`📝 [報名狀態] ${submissionsOpen ? '已開放' : '已暫停'}`);
+  res.json({ 
+    success: true,
+    submissionsOpen: submissionsOpen, 
+    message: submissionsOpen ? '✅ 報名已開放 - LINE 官方帳號可接收新照片' : '⏸️ 報名已暫停 - LINE 官方帳號暫停接收新照片',
+    timestamp: new Date().toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' })
   });
 });
 
@@ -218,18 +223,15 @@ async function handleEvent(event) {
   if (event.type === 'message' && event.message.type === 'text') {
     const text = event.message.text.trim();
 
-    // [情境 1] 用戶正在輸入暱稱 (流程最後一步)
+    // [情境 1] 用戶正在輸入暱稱
     if (userState[userId] && userState[userId].step === 'WAITING_NAME') {
       const name = text;
       const data = userState[userId];
 
-      // 更新活動時間
       updateActivity();
 
-      // 🆕 使用新的 key 生成邏輯
       const submissionKey = generateSubmissionKey(userId);
       
-      // --- 記憶體防爆檢查 ---
       const isOverwrite = !testMode && submissions.has(userId);
       if (submissions.size >= MAX_MEMORY_PHOTOS) {
         const oldestKey = submissions.keys().next().value;
@@ -237,7 +239,6 @@ async function handleEvent(event) {
         console.log(`⚠️ [記憶體保護] 已自動移除最舊資料 (${oldestKey.substring(0, 10)}...)`);
       }
 
-      // 🆕 根據測試模式調整回覆訊息
       let replyText;
       if (testMode) {
         const userPhotoCount = Array.from(submissions.keys()).filter(k => k.startsWith(userId)).length + 1;
@@ -248,11 +249,10 @@ async function handleEvent(event) {
           : `報名成功！感謝 ${name} 的參與 🏆`;
       }
 
-      // 寫入正式名單
       submissions.set(submissionKey, {
         id: Date.now(),
-        odialog: submissionKey,  // 🆕 儲存實際的 key (用於前端識別)
-        userId: userId,           // 🆕 保留原始 userId
+        odialog: submissionKey,
+        userId: userId,
         url: data.tempUrl,
         cat: data.cat,
         uploader: name,
@@ -262,7 +262,6 @@ async function handleEvent(event) {
         timestamp: Date.now()
       });
 
-      // 清除狀態
       delete userState[userId];
       isHandledByPhotoBot = true;
 
@@ -271,21 +270,30 @@ async function handleEvent(event) {
       return client.replyMessage(event.replyToken, { type: 'text', text: replyText });
     }
 
-    // [情境 2] 用戶點選選單報名 (無聲模式)
+    // [情境 2] 用戶點選選單報名
     if (text.includes('#我要報名')) {
+      // 🆕 V23: 檢查報名是否開放
+      if (!submissionsOpen) {
+        isHandledByPhotoBot = true;
+        console.log(`⏸️ [報名暫停] 用戶 ${userId.substring(0, 10)}... 嘗試報名但已暫停`);
+        return client.replyMessage(event.replyToken, { 
+          type: 'text', 
+          text: '⏸️ 報名已暫停\n\n感謝您的參與！目前活動報名已暫時關閉，請稍後再試或聯繫現場工作人員 🙏' 
+        });
+      }
+      
       let cat = '';
       if (text.includes('新郎')) cat = 'groom';
       else if (text.includes('新娘')) cat = 'bride';
       else if (text.includes('創意')) cat = 'creative';
 
       if (cat) {
-        // 更新活動時間
         updateActivity();
         
         userState[userId] = { 
           step: 'WAITING_PHOTO', 
           cat: cat,
-          timestamp: Date.now()  // 加入時間戳記供逾時清理
+          timestamp: Date.now()
         };
         isHandledByPhotoBot = true;
         console.log(`📝 [開始報名] 用戶選擇: ${cat} ${testMode ? '[測試模式]' : ''}`);
@@ -300,39 +308,43 @@ async function handleEvent(event) {
   if (event.type === 'message' && event.message.type === 'image') {
     const now = Date.now();
 
-    // 🆕 [檢查 1] 批次上傳檢測 - 測試模式下跳過此檢查
+    // 🆕 V23: 檢查報名是否開放
+    if (!submissionsOpen) {
+      console.log(`⏸️ [報名暫停] 用戶 ${userId.substring(0, 10)}... 上傳照片但報名已暫停`);
+      isHandledByPhotoBot = true;
+      return client.replyMessage(event.replyToken, { 
+        type: 'text', 
+        text: '⏸️ 報名已暫停\n\n感謝您的參與！目前活動報名已暫時關閉，請稍後再試或聯繫現場工作人員 🙏' 
+      });
+    }
+
+    // 批次上傳檢測 - 測試模式下跳過
     if (!testMode && lastImageUpload[userId] && (now - lastImageUpload[userId]) < BATCH_UPLOAD_THRESHOLD) {
       console.log(`⚠️ [批次上傳] 用戶 ${userId.substring(0, 10)}... 短時間內上傳多張`);
       isHandledByPhotoBot = true;
-      // 不存入記憶體，直接回覆警告
       return client.replyMessage(event.replyToken, { 
         type: 'text', 
         text: '⚠️ 一次只能上傳一張照片喔！\n\n請重新點選選單，選擇報名項目後，再上傳「一張」照片 📸' 
       });
     }
 
-    // 更新最後上傳時間
     lastImageUpload[userId] = now;
 
-    // [檢查 2] 是否有選擇報名項目 (WAITING_PHOTO 狀態)
+    // 檢查是否有選擇報名項目
     if (!userState[userId] || userState[userId].step !== 'WAITING_PHOTO') {
       console.log(`📢 [未報名] 用戶 ${userId.substring(0, 10)}... 直接上傳照片但未選擇報名項目`);
       isHandledByPhotoBot = true;
-      // 不存入記憶體，提醒先選擇報名項目
       return client.replyMessage(event.replyToken, { 
         type: 'text', 
         text: '請先點選下方選單，選擇報名項目喔！🎯\n\n選好後再上傳您的美照 📸' 
       });
     }
 
-    // [正常流程] 狀態為 WAITING_PHOTO，開始處理圖片
     isHandledByPhotoBot = true;
 
     try {
-      // 更新活動時間
       updateActivity();
 
-      // 取得照片
       const stream = await client.getMessageContent(event.message.id);
       const chunks = [];
       for await (const chunk of stream) { 
@@ -340,16 +352,13 @@ async function handleEvent(event) {
       }
       const originalBuffer = Buffer.concat(chunks);
 
-      // 🔥 關鍵：壓縮圖片
       const compressedBuffer = await compressImage(originalBuffer);
       const base64Img = `data:image/jpeg;base64,${compressedBuffer.toString('base64')}`;
 
-      // 更新狀態：暫存照片，改為等待暱稱
       userState[userId].step = 'WAITING_NAME';
       userState[userId].tempUrl = base64Img;
-      userState[userId].timestamp = Date.now(); // 更新時間戳記
+      userState[userId].timestamp = Date.now();
 
-      // 🆕 測試模式下的提示訊息
       const modeHint = testMode ? '\n\n🧪 測試模式：此照片不會覆蓋之前的上傳' : '';
 
       return client.replyMessage(event.replyToken, { 
@@ -368,7 +377,7 @@ async function handleEvent(event) {
   }
 
   // ==========================================
-  //  C. 轉接給 Excel 查桌次 (若上面都沒處理)
+  //  C. 轉接給 Excel 查桌次
   // ==========================================
   if (!isHandledByPhotoBot && GAS_URL) {
     try {
@@ -400,7 +409,7 @@ async function handleEvent(event) {
 }
 
 // ====================================
-// 10. API 端點
+// 10. 其他 API 端點
 // ====================================
 
 // 取得所有照片
@@ -409,7 +418,7 @@ app.get('/api/photos', (req, res) => {
   res.json(list);
 });
 
-// 手動清空 (緊急用)
+// 手動清空
 app.post('/api/clear', (req, res) => {
   const photoCount = submissions.size;
   clearAllData();
@@ -420,7 +429,7 @@ app.post('/api/clear', (req, res) => {
   });
 });
 
-// 手動延長時間 (重設 2 小時計時器)
+// 延長時間
 app.post('/api/extend', (req, res) => {
   updateActivity();
   res.json({ 
@@ -436,11 +445,11 @@ app.post('/api/extend', (req, res) => {
 const port = process.env.PORT || 3000;
 app.listen(port, () => {
   console.log('========================================');
-  console.log(`🚀 婚禮神攝手後端啟動 - Port ${port}`);
+  console.log(`🚀 婚禮神攝手後端 V23 啟動 - Port ${port}`);
   console.log(`📦 最大照片數: ${MAX_MEMORY_PHOTOS} 張`);
-  console.log(`🖼️ 圖片壓縮: ${IMAGE_CONFIG.maxSize}px (最長邊) / ${IMAGE_CONFIG.quality}%`);
+  console.log(`🖼️ 圖片壓縮: ${IMAGE_CONFIG.maxSize}px / ${IMAGE_CONFIG.quality}%`);
   console.log(`⏰ 自動清空: ${INACTIVITY_CLEAR_TIME / 1000 / 60} 分鐘無活動`);
-  console.log(`🗑️ userState 逾時: ${USER_STATE_TIMEOUT / 1000 / 60} 分鐘`);
   console.log(`🧪 測試模式: ${testMode ? '開啟' : '關閉'}`);
+  console.log(`📝 報名狀態: ${submissionsOpen ? '開放' : '暫停'}`);
   console.log('========================================');
 });
