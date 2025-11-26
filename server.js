@@ -1,7 +1,6 @@
 const express = require('express');
 const { Client, middleware } = require('@line/bot-sdk');
 const cors = require('cors');
-const sharp = require('sharp');
 const app = express();
 
 // ====================================
@@ -21,8 +20,6 @@ const client = new Client(config);
 let submissions = new Map();
 let userState = {};
 let lastImageUpload = {};
-
-// 🆕 V25: 測試模式持續類別記憶
 let userLastCategory = {};
 
 let testMode = process.env.TEST_MODE === 'true' || false;
@@ -30,20 +27,15 @@ let submissionsOpen = true;
 let guestCounter = 0;
 
 // ====================================
-// 3. 安全機制設定 - 🆕 V25: 放寬限制
+// 3. 安全機制設定
 // ====================================
-const MAX_MEMORY_PHOTOS = 150;  // 🆕 V25: 60 → 150 張
+// 🆕 V25.1: LINE 已壓縮，每張約 200-500KB
+// 150 張 × 500KB = 75MB，加上 base64 增加 33% ≈ 100MB
+// 512MB 免費版綽綽有餘
+const MAX_MEMORY_PHOTOS = 150;
 const USER_STATE_TIMEOUT = 5 * 60 * 1000;
 const INACTIVITY_CLEAR_TIME = 6 * 60 * 60 * 1000;
-
-const IMAGE_CONFIG = {
-  maxSize: 1920,
-  quality: 65,  // 🆕 V25: 70 → 65 稍微降低以容納更多照片
-};
-
 const MAX_NICKNAME_LENGTH = 9;
-
-// 🆕 V25: 重試設定
 const MAX_RETRIES = 3;
 const RETRY_DELAY = 1000;
 
@@ -93,7 +85,7 @@ setInterval(() => {
 }, 60 * 1000);
 
 // ====================================
-// 6. 圖片處理函式 - 🆕 V25: 加入重試機制
+// 6. 圖片處理函式 - 🆕 V25.1: 不再壓縮！
 // ====================================
 async function getImageWithRetry(messageId, retries = MAX_RETRIES) {
   for (let i = 0; i < retries; i++) {
@@ -103,7 +95,9 @@ async function getImageWithRetry(messageId, retries = MAX_RETRIES) {
       for await (const chunk of stream) {
         chunks.push(chunk);
       }
-      return Buffer.concat(chunks);
+      const buffer = Buffer.concat(chunks);
+      console.log(`📸 [圖片] ${(buffer.length / 1024).toFixed(1)}KB (LINE 已壓縮)`);
+      return buffer;
     } catch (error) {
       console.log(`⚠️ [重試 ${i + 1}/${retries}] 取得圖片失敗: ${error.code || error.message}`);
       if (i < retries - 1) {
@@ -112,26 +106,6 @@ async function getImageWithRetry(messageId, retries = MAX_RETRIES) {
         throw error;
       }
     }
-  }
-}
-
-async function compressImage(buffer) {
-  try {
-    const compressed = await sharp(buffer)
-      .resize(IMAGE_CONFIG.maxSize, IMAGE_CONFIG.maxSize, { 
-        withoutEnlargement: true,
-        fit: 'inside'
-      })
-      .jpeg({ quality: IMAGE_CONFIG.quality, mozjpeg: true })
-      .toBuffer();
-    
-    const originalKB = (buffer.length / 1024).toFixed(1);
-    const compressedKB = (compressed.length / 1024).toFixed(1);
-    console.log(`📸 [壓縮] ${originalKB}KB → ${compressedKB}KB`);
-    return compressed;
-  } catch (error) {
-    console.error('⚠️ [壓縮失敗]', error.message);
-    return buffer;
   }
 }
 
@@ -150,8 +124,6 @@ function truncateNickname(name) {
 // 7. API 端點
 // ====================================
 app.use(cors());
-// ⚠️ 注意：不要在這裡全局使用 express.json()
-// LINE SDK middleware 需要原始的 request body 來驗證簽名
 
 app.get('/api/status', (req, res) => {
   const memUsage = process.memoryUsage();
@@ -194,15 +166,11 @@ app.post('/api/submission-status', (req, res) => {
   res.json({ success: true, submissionsOpen, message: submissionsOpen ? '✅ 報名已開放' : '⏸️ 報名已暫停' });
 });
 
-// ====================================
-// 🆕 V25: 照片狀態同步 API
-// ====================================
 app.get('/api/photos', (req, res) => {
   const list = Array.from(submissions.values());
   res.json(list);
 });
 
-// 🆕 V25: 更新單張照片狀態
 app.post('/api/photos/:id/status', express.json(), (req, res) => {
   const { id } = req.params;
   const { status, isWinner } = req.body;
@@ -216,7 +184,6 @@ app.post('/api/photos/:id/status', express.json(), (req, res) => {
     photo.status = status;
   }
   if (isWinner !== undefined) {
-    // 如果設為冠軍，先取消同類別其他冠軍
     if (isWinner) {
       for (const [key, p] of submissions) {
         if (p.cat === photo.cat && p.isWinner) {
@@ -234,7 +201,6 @@ app.post('/api/photos/:id/status', express.json(), (req, res) => {
   res.json({ success: true, photo });
 });
 
-// 🆕 V25: 批次更新狀態
 app.post('/api/photos/batch-update', express.json(), (req, res) => {
   const { updates } = req.body;
   
@@ -277,7 +243,6 @@ async function handleEvent(event) {
   if (event.type === 'message' && event.message.type === 'text') {
     const text = event.message.text.trim();
 
-    // 用戶正在輸入暱稱 (非測試模式)
     if (userState[userId] && userState[userId].step === 'WAITING_NAME') {
       let name = truncateNickname(text);
       const data = userState[userId];
@@ -300,7 +265,7 @@ async function handleEvent(event) {
         cat: data.cat,
         uploader: name,
         avatar: '',
-        status: 'pending',  // 🆕 V25: 後端也存儲狀態
+        status: 'pending',
         isWinner: false,
         timestamp: Date.now()
       });
@@ -315,7 +280,6 @@ async function handleEvent(event) {
       });
     }
 
-    // 用戶點選選單報名
     if (text.includes('#我要報名')) {
       if (!submissionsOpen) {
         isHandledByPhotoBot = true;
@@ -333,7 +297,6 @@ async function handleEvent(event) {
       if (cat) {
         updateActivity();
         userState[userId] = { step: 'WAITING_PHOTO', cat, timestamp: Date.now() };
-        // 🆕 V25: 記住用戶選擇的類別（測試模式用）
         userLastCategory[userId] = cat;
         isHandledByPhotoBot = true;
         console.log(`📝 [選擇類別] ${cat} ${testMode ? '[測試模式]' : ''}`);
@@ -342,7 +305,7 @@ async function handleEvent(event) {
     }
   }
 
-  // 🆕 V25: 影片訊息處理 - 拒絕接收
+  // 影片拒絕
   if (event.type === 'message' && event.message.type === 'video') {
     isHandledByPhotoBot = true;
     console.log(`🎬 [影片拒絕] 用戶 ${userId.substring(0, 10)}... 上傳影片`);
@@ -362,27 +325,23 @@ async function handleEvent(event) {
       });
     }
 
-    // 🆕 V25: 測試模式 - 使用記憶的類別
+    // 測試模式
     if (testMode) {
       isHandledByPhotoBot = true;
       
-      // 🆕 V25: 優先使用 userState，其次使用 userLastCategory
-      let cat = 'creative';  // 預設
+      let cat = 'creative';
       if (userState[userId] && userState[userId].step === 'WAITING_PHOTO') {
         cat = userState[userId].cat;
-        // 不清除 userState，保留類別記憶
       } else if (userLastCategory[userId]) {
-        // 使用上次選擇的類別
         cat = userLastCategory[userId];
       }
 
       try {
         updateActivity();
         
-        // 🆕 V25: 使用重試機制
-        const originalBuffer = await getImageWithRetry(event.message.id);
-        const compressedBuffer = await compressImage(originalBuffer);
-        const base64Img = `data:image/jpeg;base64,${compressedBuffer.toString('base64')}`;
+        // 🆕 V25.1: 直接使用 LINE 壓縮後的圖片，不再二次壓縮
+        const imageBuffer = await getImageWithRetry(event.message.id);
+        const base64Img = `data:image/jpeg;base64,${imageBuffer.toString('base64')}`;
 
         guestCounter++;
         const autoName = `賓客${guestCounter}`;
@@ -426,10 +385,9 @@ async function handleEvent(event) {
     try {
       updateActivity();
       
-      // 🆕 V25: 使用重試機制
-      const originalBuffer = await getImageWithRetry(event.message.id);
-      const compressedBuffer = await compressImage(originalBuffer);
-      const base64Img = `data:image/jpeg;base64,${compressedBuffer.toString('base64')}`;
+      // 🆕 V25.1: 直接使用 LINE 壓縮後的圖片
+      const imageBuffer = await getImageWithRetry(event.message.id);
+      const base64Img = `data:image/jpeg;base64,${imageBuffer.toString('base64')}`;
 
       userState[userId].step = 'WAITING_NAME';
       userState[userId].tempUrl = base64Img;
@@ -490,9 +448,9 @@ app.post('/api/extend', (req, res) => {
 const port = process.env.PORT || 3000;
 app.listen(port, () => {
   console.log('========================================');
-  console.log(`🚀 婚禮神攝手後端 V25 - Port ${port}`);
+  console.log(`🚀 婚禮神攝手後端 V25.1 - Port ${port}`);
   console.log(`📦 最大照片數: ${MAX_MEMORY_PHOTOS} 張`);
-  console.log(`🖼️ 圖片品質: ${IMAGE_CONFIG.quality}%`);
+  console.log(`🖼️ 直接使用 LINE 壓縮圖片 (無二次壓縮)`);
   console.log(`⏰ 自動清空: 6 小時無活動`);
   console.log(`🔄 重試次數: ${MAX_RETRIES}`);
   console.log('========================================');
