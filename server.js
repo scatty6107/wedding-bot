@@ -40,7 +40,7 @@ let guestCounter = 0;
 // ====================================
 // 3. 安全機制設定
 // ====================================
-const MAX_MEMORY_PHOTOS = 150; 
+const MAX_MEMORY_PHOTOS = 300;  // 🔧 從 150 改為 300，支援更多投稿者
 const USER_STATE_TIMEOUT = 5 * 60 * 1000;
 const INACTIVITY_CLEAR_TIME = 6 * 60 * 60 * 1000;
 const MAX_NICKNAME_LENGTH = 9;
@@ -443,7 +443,7 @@ async function handleEvent(event) {
 const port = process.env.PORT || 3000;
 app.listen(port, () => {
   console.log('========================================');
-  console.log(`🚀 婚禮神攝手後端 V25.1 (Cloudinary 無壓縮版) - Port ${port}`);
+  console.log(`🚀 婚禮神攝手後端 V26.6 (Cloudinary) - Port ${port}`);
   console.log(`📦 最大照片數: ${MAX_MEMORY_PHOTOS} 張`);
   console.log(`☁️ 圖片儲存: Cloudinary (原圖上傳)`);
   console.log(`⏰ 自動清空: 6 小時無活動`);
