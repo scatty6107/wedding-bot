@@ -37,32 +37,24 @@ let testMode = process.env.TEST_MODE === 'true' || false;
 let submissionsOpen = true;
 let guestCounter = 0;
 
+// 🔥 新增：全域鎖定狀態 (預設為 false)
+let winnersLocked = false;
+
 // ====================================
 // 3. 安全機制設定
 // ====================================
 const MAX_MEMORY_PHOTOS = 300; 
 const USER_STATE_TIMEOUT = 5 * 60 * 1000;
-// const INACTIVITY_CLEAR_TIME = 6 * 60 * 60 * 1000; // 🚫 V26.7: 停用自動清空時間設定
 const MAX_NICKNAME_LENGTH = 9;
 
 // ====================================
-// 4. 活動追蹤 (已移除自動清空)
+// 4. 活動追蹤
 // ====================================
 let lastActivityTime = Date.now();
-// let inactivityTimer = null; // 🚫 V26.7: 移除計時器變數
 
 function updateActivity() {
   lastActivityTime = Date.now();
-  // resetInactivityTimer(); // 🚫 V26.7: 不再重置計時器
 }
-
-// 🚫 V26.7: 移除自動清空邏輯，確保資料永久保留直到手動重置
-/*
-function resetInactivityTimer() {
-  if (inactivityTimer) clearTimeout(inactivityTimer);
-  inactivityTimer = setTimeout(() => clearAllData(), INACTIVITY_CLEAR_TIME);
-}
-*/
 
 function clearAllData() {
   const photoCount = submissions.size;
@@ -71,10 +63,9 @@ function clearAllData() {
   lastImageUpload = {};
   userLastCategory = {};
   guestCounter = 0;
+  winnersLocked = false; // 🔥 重置時也要解鎖
   console.log(`🧹 [手動清空] 已清除 ${photoCount} 張照片`);
 }
-
-// resetInactivityTimer(); // 🚫 啟動時也不倒數
 
 // ====================================
 // 5. userState 逾時清理
@@ -89,28 +80,23 @@ setInterval(() => {
 }, 60 * 1000);
 
 // ====================================
-// 6. 圖片處理函式 (Cloudinary 原圖上傳)
+// 6. 圖片處理函式
 // ====================================
 async function uploadToCloudinary(messageId, userId) {
     return new Promise(async (resolve, reject) => {
         try {
-            // 取得 LINE 圖片串流
             const stream = await client.getMessageContent(messageId);
-            
-            // 建立 Cloudinary 上傳串流
             const uploadStream = cloudinary.uploader.upload_stream(
                 {
-                    folder: "wedding_2025", // 雲端資料夾名稱
-                    public_id: `${userId}_${Date.now()}`, // 檔名
+                    folder: "wedding_2025", 
+                    public_id: `${userId}_${Date.now()}`,
                     resource_type: "image",
-                    // 保留原圖畫質
                 },
                 (error, result) => {
                     if (error) return reject(error);
-                    resolve(result.secure_url); // 回傳網址
+                    resolve(result.secure_url); 
                 }
             );
-
             stream.pipe(uploadStream);
         } catch (error) {
             reject(error);
@@ -122,7 +108,6 @@ function generateSubmissionKey(userId) {
   if (testMode) {
     return `${userId}_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
   }
-  // 正式模式：使用 userId 當 key，確保一人一張 (可覆蓋)
   return userId;
 }
 
@@ -141,14 +126,24 @@ app.get('/api/status', (req, res) => {
     photos: submissions.size,
     maxPhotos: MAX_MEMORY_PHOTOS,
     pendingUploads: Object.keys(userState).length,
-    testMode, submissionsOpen, guestCounter,
+    testMode, submissionsOpen, guestCounter, winnersLocked, // 🔥 回傳鎖定狀態
     lastActivity: new Date(lastActivityTime).toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' }),
-    nextAutoClear: "已停用 (無限期保留)", // V26.7 更新顯示
+    nextAutoClear: "已停用 (無限期保留)", 
     memory: {
       heapUsed: `${(memUsage.heapUsed / 1024 / 1024).toFixed(1)} MB`,
       rss: `${(memUsage.rss / 1024 / 1024).toFixed(1)} MB`
     }
   });
+});
+
+// 🔥 新增：設定鎖定狀態 API
+app.post('/api/winners/lock', express.json(), (req, res) => {
+    const { locked } = req.body;
+    if (locked !== undefined) {
+        winnersLocked = locked;
+        console.log(`🔒 [得獎名單] ${locked ? '已鎖定' : '已解鎖'}`);
+    }
+    res.json({ success: true, winnersLocked });
 });
 
 app.post('/api/test-mode', (req, res) => {
@@ -239,6 +234,7 @@ app.post('/api/clear', (req, res) => {
   lastImageUpload = {};
   userLastCategory = {};
   guestCounter = 0;
+  winnersLocked = false; // 🔥 重置時解鎖
   res.json({ success: true, message: `已清空 ${count} 張照片` });
 });
 
@@ -252,7 +248,7 @@ app.post('/webhook', middleware(config), (req, res) => {
 });
 
 // ====================================
-// 9. 主要事件處理 (入圍保護機制)
+// 9. 主要事件處理
 // ====================================
 async function handleEvent(event) {
   const userId = event.source.userId;
@@ -333,7 +329,7 @@ async function handleEvent(event) {
     });
   }
 
-  // B. 圖片訊息處理 (入圍保護)
+  // B. 圖片訊息處理
   if (event.type === 'message' && event.message.type === 'image') {
     if (!submissionsOpen) {
       isHandledByPhotoBot = true;
@@ -343,10 +339,11 @@ async function handleEvent(event) {
       });
     }
 
-    // 正式模式：入圍保護
+    // 正式模式：入圍保護 (這裡也檢查 winnersLocked 變數)
     if (!testMode) {
         const existing = submissions.get(userId);
         if (existing && (existing.status === 'approved' || existing.isWinner)) {
+            // 如果名單已鎖定，或是該照片已入圍，都不可修改
             isHandledByPhotoBot = true;
             console.log(`🛡️ [入圍保護] ${existing.uploader} 試圖覆蓋入圍照片，已攔截`);
             return client.replyMessage(event.replyToken, { 
@@ -402,7 +399,7 @@ async function handleEvent(event) {
       }
     }
 
-    // 正式模式 (正常賓客)
+    // 正式模式
     if (!userState[userId] || userState[userId].step !== 'WAITING_PHOTO') {
       isHandledByPhotoBot = true;
       return client.replyMessage(event.replyToken, { 
@@ -458,7 +455,7 @@ async function handleEvent(event) {
 const port = process.env.PORT || 3000;
 app.listen(port, () => {
   console.log('========================================');
-  console.log(`🚀 婚禮神攝手後端 V26.7 (無自動清空) - Port ${port}`);
+  console.log(`🚀 婚禮神攝手後端 V26.8 (SyncLock) - Port ${port}`);
   console.log(`📦 最大照片數: ${MAX_MEMORY_PHOTOS} 張`);
   console.log(`☁️ 圖片儲存: Cloudinary`);
   console.log(`⏰ 自動清空: 已停用`);
