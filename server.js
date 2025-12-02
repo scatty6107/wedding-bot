@@ -40,26 +40,29 @@ let guestCounter = 0;
 // ====================================
 // 3. 安全機制設定
 // ====================================
-const MAX_MEMORY_PHOTOS = 300;  // 🔧 從 150 改為 300，支援更多投稿者
+const MAX_MEMORY_PHOTOS = 300; 
 const USER_STATE_TIMEOUT = 5 * 60 * 1000;
-const INACTIVITY_CLEAR_TIME = 6 * 60 * 60 * 1000;
+// const INACTIVITY_CLEAR_TIME = 6 * 60 * 60 * 1000; // 🚫 V26.7: 停用自動清空時間設定
 const MAX_NICKNAME_LENGTH = 9;
 
 // ====================================
-// 4. 活動追蹤 & 自動清空機制
+// 4. 活動追蹤 (已移除自動清空)
 // ====================================
 let lastActivityTime = Date.now();
-let inactivityTimer = null;
+// let inactivityTimer = null; // 🚫 V26.7: 移除計時器變數
 
 function updateActivity() {
   lastActivityTime = Date.now();
-  resetInactivityTimer();
+  // resetInactivityTimer(); // 🚫 V26.7: 不再重置計時器
 }
 
+// 🚫 V26.7: 移除自動清空邏輯，確保資料永久保留直到手動重置
+/*
 function resetInactivityTimer() {
   if (inactivityTimer) clearTimeout(inactivityTimer);
   inactivityTimer = setTimeout(() => clearAllData(), INACTIVITY_CLEAR_TIME);
 }
+*/
 
 function clearAllData() {
   const photoCount = submissions.size;
@@ -68,10 +71,10 @@ function clearAllData() {
   lastImageUpload = {};
   userLastCategory = {};
   guestCounter = 0;
-  console.log(`🧹 [自動清空] 6小時無活動，已清除 ${photoCount} 張照片`);
+  console.log(`🧹 [手動清空] 已清除 ${photoCount} 張照片`);
 }
 
-resetInactivityTimer();
+// resetInactivityTimer(); // 🚫 啟動時也不倒數
 
 // ====================================
 // 5. userState 逾時清理
@@ -100,7 +103,7 @@ async function uploadToCloudinary(messageId, userId) {
                     folder: "wedding_2025", // 雲端資料夾名稱
                     public_id: `${userId}_${Date.now()}`, // 檔名
                     resource_type: "image",
-                    // 👇 已移除 transformation 壓縮設定，保留原圖畫質
+                    // 保留原圖畫質
                 },
                 (error, result) => {
                     if (error) return reject(error);
@@ -119,6 +122,7 @@ function generateSubmissionKey(userId) {
   if (testMode) {
     return `${userId}_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
   }
+  // 正式模式：使用 userId 當 key，確保一人一張 (可覆蓋)
   return userId;
 }
 
@@ -139,7 +143,7 @@ app.get('/api/status', (req, res) => {
     pendingUploads: Object.keys(userState).length,
     testMode, submissionsOpen, guestCounter,
     lastActivity: new Date(lastActivityTime).toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' }),
-    nextAutoClear: new Date(lastActivityTime + INACTIVITY_CLEAR_TIME).toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' }),
+    nextAutoClear: "已停用 (無限期保留)", // V26.7 更新顯示
     memory: {
       heapUsed: `${(memUsage.heapUsed / 1024 / 1024).toFixed(1)} MB`,
       rss: `${(memUsage.rss / 1024 / 1024).toFixed(1)} MB`
@@ -248,7 +252,7 @@ app.post('/webhook', middleware(config), (req, res) => {
 });
 
 // ====================================
-// 9. 主要事件處理 (整合 Cloudinary)
+// 9. 主要事件處理 (入圍保護機制)
 // ====================================
 async function handleEvent(event) {
   const userId = event.source.userId;
@@ -275,7 +279,7 @@ async function handleEvent(event) {
         id: Date.now(),
         odialog: submissionKey,
         userId: userId,
-        url: data.tempUrl, // 這裡已經是 Cloudinary 的網址
+        url: data.tempUrl, 
         cat: data.cat,
         uploader: name,
         avatar: '',
@@ -290,7 +294,7 @@ async function handleEvent(event) {
 
       return client.replyMessage(event.replyToken, { 
         type: 'text', 
-        text: isOverwrite ? `收到！${name}，您的作品已更新 ✨` : `報名成功！感謝 ${name} 的參與 🏆` 
+        text: `報名成功！感謝 ${name} 的參與 🏆\n(您可以繼續上傳更多照片喔！)` 
       });
     }
 
@@ -329,7 +333,7 @@ async function handleEvent(event) {
     });
   }
 
-  // B. 圖片訊息處理 (整合 Cloudinary)
+  // B. 圖片訊息處理 (入圍保護)
   if (event.type === 'message' && event.message.type === 'image') {
     if (!submissionsOpen) {
       isHandledByPhotoBot = true;
@@ -337,6 +341,19 @@ async function handleEvent(event) {
         type: 'text', 
         text: '⏸️ 婚禮神攝手投稿已截止\n\n感謝您的參與！如有美照歡迎私底下傳給我們 🙏' 
       });
+    }
+
+    // 正式模式：入圍保護
+    if (!testMode) {
+        const existing = submissions.get(userId);
+        if (existing && (existing.status === 'approved' || existing.isWinner)) {
+            isHandledByPhotoBot = true;
+            console.log(`🛡️ [入圍保護] ${existing.uploader} 試圖覆蓋入圍照片，已攔截`);
+            return client.replyMessage(event.replyToken, { 
+                type: 'text', 
+                text: `🏆 恭喜您！\n\n您的照片已經【入圍決選名單】囉！\n為了確保評選公平，入圍後無法再修改照片。\n\n請期待稍後的頒獎典禮 🎉` 
+            });
+        }
     }
 
     // 測試模式
@@ -353,7 +370,6 @@ async function handleEvent(event) {
       try {
         updateActivity();
         
-        // 🔥 上傳至 Cloudinary
         const imageUrl = await uploadToCloudinary(event.message.id, userId);
 
         guestCounter++;
@@ -366,7 +382,7 @@ async function handleEvent(event) {
 
         submissions.set(submissionKey, {
           id: Date.now(), odialog: submissionKey, userId,
-          url: imageUrl, // 存入雲端網址
+          url: imageUrl, 
           cat, uploader: autoName,
           avatar: '', status: 'pending', isWinner: false, timestamp: Date.now()
         });
@@ -386,7 +402,7 @@ async function handleEvent(event) {
       }
     }
 
-    // 正式模式
+    // 正式模式 (正常賓客)
     if (!userState[userId] || userState[userId].step !== 'WAITING_PHOTO') {
       isHandledByPhotoBot = true;
       return client.replyMessage(event.replyToken, { 
@@ -399,7 +415,6 @@ async function handleEvent(event) {
     try {
       updateActivity();
       
-      // 🔥 上傳至 Cloudinary
       const imageUrl = await uploadToCloudinary(event.message.id, userId);
 
       userState[userId].step = 'WAITING_NAME';
@@ -443,9 +458,9 @@ async function handleEvent(event) {
 const port = process.env.PORT || 3000;
 app.listen(port, () => {
   console.log('========================================');
-  console.log(`🚀 婚禮神攝手後端 V26.6 (Cloudinary) - Port ${port}`);
+  console.log(`🚀 婚禮神攝手後端 V26.7 (無自動清空) - Port ${port}`);
   console.log(`📦 最大照片數: ${MAX_MEMORY_PHOTOS} 張`);
-  console.log(`☁️ 圖片儲存: Cloudinary (原圖上傳)`);
-  console.log(`⏰ 自動清空: 6 小時無活動`);
+  console.log(`☁️ 圖片儲存: Cloudinary`);
+  console.log(`⏰ 自動清空: 已停用`);
   console.log('========================================');
 });
