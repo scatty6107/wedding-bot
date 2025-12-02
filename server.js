@@ -290,7 +290,7 @@ async function handleEvent(event) {
 
       return client.replyMessage(event.replyToken, { 
         type: 'text', 
-        text: `報名成功！感謝 ${name} 的參與 🏆\n(您可以繼續上傳更多照片喔！)` 
+        text: `報名成功！感謝 ${name} 的參與 🏆\n(您可以重新投稿更好的照片喔！)` 
       });
     }
 
